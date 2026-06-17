@@ -292,6 +292,82 @@ class Nanobot:
         """Release resources held by this instance (MCP connections, etc.)."""
         await self._loop.close_mcp()
 
+    # -- Direct tool invocation (bypasses LLM) — spec tool-invocation-interface#3, #4, #13 --
+
+    async def acall(
+        self,
+        tool: str,
+        params: dict,
+        *,
+        timeout: float | None = None,
+    ) -> "ToolResult":
+        """Asynchronously invoke a single tool by name.
+
+        Default timeout 30s (or ``tool.meta.timeout_s`` if smaller).
+        Does NOT raise on tool failure — returns ToolResult with ok=False.
+        """
+        from nanobot.agent.tools.invoker import ToolResult
+        return await self._loop.tools.invoke(tool, params, timeout=timeout)
+
+    def call(
+        self,
+        tool: str,
+        params: dict,
+        *,
+        timeout: float | None = None,
+    ) -> "ToolResult":
+        """Synchronously invoke a single tool by name.
+
+        Wraps :meth:`acall` with ``asyncio.run``. Cannot be called from
+        within a running event loop — use :meth:`acall` in that case.
+        """
+        import asyncio as _asyncio
+        return _asyncio.run(self.acall(tool, params, timeout=timeout))
+
+    def list_capabilities(
+        self,
+        *,
+        mode: str | None = None,
+    ) -> list["CapabilityInfo"]:
+        """List business capabilities. See :meth:`ToolRegistry.list_capabilities`."""
+        return self._loop.tools.list_capabilities(mode=mode)
+
+    def get_capability_metadata(self, name: str) -> "CapabilityMetadata | None":
+        """Read capability metadata. See :meth:`ToolRegistry.get_capability_metadata`."""
+        return self._loop.tools.get_capability_metadata(name)
+
+    def register_tool(self, tool) -> None:
+        """Register a tool. Audit-logged as ``tool_registered`` with source=sdk."""
+        import logging
+        self._loop.tools.register(tool)
+        logging.getLogger("nanobot.audit").info(
+            "tool_registered",
+            extra={
+                "tool_name": tool.name,
+                "owner": getattr(tool, "owner", "default"),
+                "version": getattr(tool, "version", "0.1.0"),
+                "source": "sdk",
+            },
+        )
+
+    def unregister_tool(self, name: str) -> bool:
+        """Unregister a tool by name. Returns True if it existed.
+
+        Audit-logged as ``tool_unregistered`` with source=sdk.
+        """
+        import logging
+        existed = self._loop.tools.has(name)
+        self._loop.tools.unregister(name)
+        logging.getLogger("nanobot.audit").info(
+            "tool_unregistered",
+            extra={
+                "tool_name": name,
+                "existed": existed,
+                "source": "sdk",
+            },
+        )
+        return existed
+
     async def __aenter__(self) -> Nanobot:
         return self
 

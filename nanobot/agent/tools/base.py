@@ -5,6 +5,7 @@ import typing
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any, TypeVar
 
 if typing.TYPE_CHECKING:
@@ -84,16 +85,9 @@ class Schema(ABC):
             for k in schema.get("required", []):
                 if k not in val:
                     errors.append(f"missing required {Schema.subpath(path, k)}")
-            additional = schema.get("additionalProperties", True)
             for k, v in val.items():
                 if k in props:
                     errors.extend(Schema.validate_json_schema_value(v, props[k], Schema.subpath(path, k)))
-                elif additional is False:
-                    errors.append(f"unexpected parameter {Schema.subpath(path, k)}")
-                elif isinstance(additional, dict):
-                    errors.extend(
-                        Schema.validate_json_schema_value(v, additional, Schema.subpath(path, k))
-                    )
         if t == "array":
             if "minItems" in schema and len(val) < schema["minItems"]:
                 errors.append(f"{label} must have at least {schema['minItems']} items")
@@ -128,19 +122,27 @@ class Schema(ABC):
         return Schema.validate_json_schema_value(value, self.to_json_schema(), path)
 
 
-class ToolResult(str):
-    """String-compatible tool output with structured status."""
+@dataclass(frozen=True, slots=True)
+class ToolMeta:
+    """Metadata for a Tool.
 
-    is_error: bool
+    Used by capability-business-contract-bridge spec to expose tools as
+    business capabilities without breaking existing Tool subclasses.
 
-    def __new__(cls, content: str, *, is_error: bool = False) -> ToolResult:
-        obj = str.__new__(cls, content)
-        obj.is_error = is_error
-        return obj
+    11 fields, P3-compatible naming (do NOT rename — see
+    design.md D11 and spec tool-invocation-interface#1).
+    """
 
-    @classmethod
-    def error(cls, content: str) -> ToolResult:
-        return cls(content, is_error=True)
+    invocation_mode: str = "tool"  # "tool" | "capability" | "both" | "internal"
+    is_long_running: bool = False
+    is_idempotent: bool = True
+    requires_auth: frozenset[str] = frozenset()
+    timeout_s: float = 30.0
+    side_effect_class: str = "read"  # "read" | "write" | "destructive"
+    owner: str = "default"
+    version: str = "0.1.0"
+    status: str = "active"  # "active" | "deprecated" | "draft"
+    tags: frozenset[str] = frozenset()
 
 
 class Tool(ABC):
@@ -188,6 +190,42 @@ class Tool(ABC):
         """Whether this tool should run alone even if concurrency is enabled."""
         return False
 
+    @property
+    def meta(self) -> ToolMeta:
+        """Tool metadata — P3-compatible baseline.
+
+        Default returns a ToolMeta with all fields at their baseline. Subclasses
+        MAY override the property entirely, OR set any of the class-attribute
+        fallbacks below to override a single field.
+
+        Recognized class-attribute fallbacks (per spec tool-invocation-interface#1):
+
+        - ``invocation_mode: str``  — default "tool"
+        - ``is_long_running: bool`` — default False
+        - ``is_idempotent: bool``   — default True
+        - ``requires_auth: frozenset[str]`` — default empty
+        - ``timeout_s: float``     — default 30.0
+        - ``side_effect_class: str`` — default "read"
+        - ``owner: str``           — default "default"
+        - ``version: str``         — default "0.1.0"
+        - ``status: str``          — default "active"
+        - ``tags: frozenset[str]`` — default empty
+        """
+        # Pull class-attribute fallbacks if defined, else baseline.
+        cls = type(self)
+        return ToolMeta(
+            invocation_mode=getattr(cls, "invocation_mode", "tool"),
+            is_long_running=getattr(cls, "is_long_running", False),
+            is_idempotent=getattr(cls, "is_idempotent", True),
+            requires_auth=getattr(cls, "requires_auth", frozenset()),
+            timeout_s=getattr(cls, "timeout_s", 30.0),
+            side_effect_class=getattr(cls, "side_effect_class", "read"),
+            owner=getattr(cls, "owner", "default"),
+            version=getattr(cls, "version", "0.1.0"),
+            status=getattr(cls, "status", "active"),
+            tags=getattr(cls, "tags", frozenset()),
+        )
+
     # --- Plugin metadata ---
 
     config_key: str = ""
@@ -208,27 +246,14 @@ class Tool(ABC):
 
     @abstractmethod
     async def execute(self, **kwargs: Any) -> Any:
-        """Run the tool; return content, or ``ToolResult.error(...)`` for failures."""
+        """Run the tool; returns a string or list of content blocks."""
         ...
-
-    @staticmethod
-    def error(content: str) -> ToolResult:
-        return ToolResult.error(content)
 
     def _cast_object(self, obj: Any, schema: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(obj, dict):
             return obj
         props = schema.get("properties", {})
-        additional = schema.get("additionalProperties")
-        casted: dict[str, Any] = {}
-        for k, v in obj.items():
-            if k in props:
-                casted[k] = self._cast_value(v, props[k])
-            elif isinstance(additional, dict):
-                casted[k] = self._cast_value(v, additional)
-            else:
-                casted[k] = v
-        return casted
+        return {k: self._cast_value(v, props[k]) if k in props else v for k, v in obj.items()}
 
     def cast_params(self, params: dict[str, Any]) -> dict[str, Any]:
         """Apply safe schema-driven casts before validation."""
