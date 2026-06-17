@@ -8,8 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hmac
-import json as _json
+import json
 import time
 import uuid
 from typing import Any
@@ -17,6 +16,7 @@ from typing import Any
 from aiohttp import web
 from loguru import logger
 
+from nanobot.agent.tools.base import Tool
 from nanobot.config.paths import get_media_dir
 from nanobot.utils.helpers import safe_filename
 from nanobot.utils.media_decode import (
@@ -341,7 +341,6 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                             session_key=session_key,
                             channel="api",
                             chat_id=API_CHAT_ID,
-                            persist_user_message=False,
                         ),
                         timeout=timeout_s,
                     )
@@ -396,7 +395,8 @@ def create_app(
     agent_loop,
     model_name: str = "nanobot",
     request_timeout: float = 120.0,
-    api_key: str = "",
+    tool_registry=None,
+    auth_token: str = "",
 ) -> web.Application:
     """Create the aiohttp application.
 
@@ -404,31 +404,179 @@ def create_app(
         agent_loop: An initialized AgentLoop instance.
         model_name: Model name reported in responses.
         request_timeout: Per-request timeout in seconds.
-        api_key: Optional API key for Bearer-token authentication.
+        tool_registry: Optional ToolRegistry for /v1/tools/* routes.
+        auth_token: Bearer token required for write ops on /v1/tools/*.
+                    Empty string disables auth (dev mode).
     """
     app = web.Application(client_max_size=20 * 1024 * 1024)  # 20MB for base64 images
     app["agent_loop"] = agent_loop
+    app["tool_registry"] = tool_registry
+    app["auth_token"] = auth_token
     app["model_name"] = model_name
     app["request_timeout"] = request_timeout
     app["session_locks"] = {}  # per-user locks, keyed by session_key
 
-    @web.middleware
-    async def auth_middleware(request: web.Request, handler) -> web.StreamResponse:
-        if not api_key:
-            return await handler(request)
-        # Allow unauthenticated health checks.
-        if request.path == "/health":
-            return await handler(request)
-        auth = request.headers.get("Authorization", "")
-        if not auth.startswith("Bearer "):
-            return _error_json(401, "Missing Authorization header. Use: Bearer <api_key>")
-        if not hmac.compare_digest(auth[len("Bearer "):], api_key):
-            return _error_json(401, "Invalid API key")
-        return await handler(request)
-
-    app.middlewares.append(auth_middleware)
-
     app.router.add_post("/v1/chat/completions", handle_chat_completions)
     app.router.add_get("/v1/models", handle_models)
     app.router.add_get("/health", handle_health)
+
+    if tool_registry is not None:
+        # /v1/tools/* — direct capability invocation (spec tool-invocation-interface#7, #8, #9)
+        app.router.add_get("/v1/tools", handle_list_tools)
+        app.router.add_get("/v1/tools/{name}", handle_describe_tool)
+        app.router.add_post("/v1/tools/{name}/invoke", handle_invoke_tool)
+        app.router.add_post("/v1/tools/{name}/register", handle_register_tool)
+        app.router.add_delete("/v1/tools/{name}", handle_unregister_tool)
+        # v1: register a 401 short-circuit middleware for write ops
+        app.middlewares.append(_write_op_auth_middleware)
+
     return app
+
+
+# -- Auth middleware (v1 minimal) — spec runtime-tool-registration#3, #4, #7 --
+
+
+@web.middleware
+async def _write_op_auth_middleware(request: web.Request, handler):
+    """Authenticate write ops on /v1/tools/* (register/unregister/invoke).
+
+    Read ops (GET /v1/tools, /v1/tools/{name}) MUST NOT be authenticated.
+    aiohttp 3.14 new-style middleware via @web.middleware decorator.
+    """
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return await handler(request)
+    # Write op
+    expected = request.app.get("auth_token", "")
+    if not expected:
+        # Dev mode: no token configured
+        return await handler(request)
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer ") or auth[len("Bearer "):] != expected:
+        return _error_json(401, "Unauthorized", "auth_error")
+    return await handler(request)
+
+
+# -- /v1/tools/* handlers — spec tool-invocation-interface#7, #8, #9 --
+
+
+async def handle_list_tools(request: web.Request) -> web.Response:
+    mode = request.query.get("mode")  # tag filter is v1 no-op (just ignored)
+    registry = request.app["tool_registry"]
+    items = registry.list_capabilities(mode=mode)
+    return web.json_response(
+        {
+            "capabilities": [
+                {
+                    "name": i.name,
+                    "description": i.description,
+                    "parameters": i.parameters,
+                    "meta": {
+                        "invocation_mode": i.meta.invocation_mode,
+                        "is_long_running": i.meta.is_long_running,
+                        "is_idempotent": i.meta.is_idempotent,
+                        "requires_auth": sorted(i.meta.requires_auth),
+                        "timeout_s": i.meta.timeout_s,
+                        "side_effect_class": i.meta.side_effect_class,
+                        "owner": i.meta.owner,
+                        "version": i.meta.version,
+                        "status": i.meta.status,
+                        "tags": sorted(i.meta.tags),
+                    },
+                }
+                for i in items
+            ]
+        }
+    )
+
+
+async def handle_describe_tool(request: web.Request) -> web.Response:
+    name = request.match_info["name"]
+    meta = request.app["tool_registry"].get_capability_metadata(name)
+    if meta is None:
+        return _error_json(404, f"Tool '{name}' not found", "not_found")
+    return web.json_response(
+        {
+            "name": meta.name,
+            "invocation_mode": meta.invocation_mode,
+            "is_long_running": meta.is_long_running,
+            "is_idempotent": meta.is_idempotent,
+            "requires_auth": sorted(meta.requires_auth),
+            "timeout_s": meta.timeout_s,
+            "side_effect_class": meta.side_effect_class,
+            "owner": meta.owner,
+            "version": meta.version,
+            "status": meta.status,
+            "tags": sorted(meta.tags),
+        }
+    )
+
+
+async def handle_invoke_tool(request: web.Request) -> web.Response:
+    name = request.match_info["name"]
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return _error_json(400, "Invalid JSON body", "validation_error")
+    params = body.get("params", {}) or {}
+    timeout = body.get("timeout")
+    if not isinstance(params, dict):
+        return _error_json(400, "params must be a JSON object", "validation_error")
+    if timeout is not None and (not isinstance(timeout, (int, float)) or timeout <= 0):
+        return _error_json(400, "timeout must be a positive number", "validation_error")
+    registry = request.app["tool_registry"]
+    result = await registry.invoke(name, params, timeout=timeout)
+    status = 200 if result.ok else 504 if "timeout" in (result.error or "") else 400 if "Invalid parameters" in (result.error or "") or "not found" in (result.error or "") else 500
+    return web.json_response(
+        {
+            "ok": result.ok,
+            "tool_name": result.tool_name,
+            "content": result.content,
+            "error": result.error,
+            "duration_ms": result.duration_ms,
+        },
+        status=status,
+    )
+
+
+async def handle_register_tool(request: web.Request) -> web.Response:
+    # spec runtime-tool-registration#3
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return _error_json(400, "Invalid JSON body", "validation_error")
+    module = body.get("module")
+    class_name = body.get("class_name")
+    config = body.get("config", {})
+    version = body.get("version", "0.1.0")
+    if not module or not class_name:
+        return _error_json(400, "Missing 'module' or 'class_name' field", "validation_error")
+    try:
+        mod = __import__(module, fromlist=[class_name])
+        cls = getattr(mod, class_name)
+    except ImportError as e:
+        return _error_json(400, f"Cannot import module '{module}': {e}", "import_error")
+    except AttributeError:
+        return _error_json(400, f"Class '{class_name}' not found in module '{module}'", "import_error")
+    if not (isinstance(cls, type) and issubclass(cls, Tool) and cls is not Tool):
+        return _error_json(400, f"Class '{class_name}' is not a Tool subclass", "invalid_class")
+    try:
+        # Tools may require ToolContext; v1 minimal — try with config only
+        tool = cls(**config) if config else cls()
+    except TypeError as e:
+        return _error_json(400, f"Failed to instantiate '{class_name}': {e}", "type_error")
+    except Exception as e:
+        return _error_json(400, f"Failed to instantiate '{class_name}': {e}", "instantiation_error")
+    request.app["agent_loop"].tools.register(tool)
+    return web.json_response(
+        {"registered": tool.name, "version": version}, status=201
+    )
+
+
+async def handle_unregister_tool(request: web.Request) -> web.Response:
+    # spec runtime-tool-registration#4
+    name = request.match_info["name"]
+    existed = request.app["agent_loop"].tools.has(name)
+    if not existed:
+        return _error_json(404, f"Tool '{name}' not registered", "not_found")
+    request.app["agent_loop"].tools.unregister(name)
+    return web.Response(status=204)

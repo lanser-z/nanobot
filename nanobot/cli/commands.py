@@ -695,7 +695,13 @@ def serve(
         )
     console.print()
 
-    api_app = create_app(agent_loop, model_name=model_name, request_timeout=timeout)
+    api_app = create_app(
+        agent_loop,
+        model_name=model_name,
+        request_timeout=timeout,
+        tool_registry=getattr(agent_loop, "tools", None),
+        auth_token=os.environ.get("NANOBOT_HTTP_AUTH_TOKEN", ""),
+    )
 
     async def on_startup(_app):
         await agent_loop._connect_mcp()
