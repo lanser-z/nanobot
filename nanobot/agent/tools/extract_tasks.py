@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import hashlib
 
-from nanobot.agent.tools.base import Tool, ToolMeta
+from nanobot.agent.tools.base import Tool
 
 
 class ExtractTasksTool(Tool):
