@@ -148,6 +148,11 @@ class AgentDefaults(Base):
     bot_icon: str = "🐈"  # Short icon (emoji or text) shown next to the bot name in CLI; "" to omit
     unified_session: bool = False  # Share one session across all channels (single-user multi-device)
     disabled_skills: list[str] = Field(default_factory=list)  # Skill names to exclude from loading (e.g. ["summarize", "skill-creator"])
+    # Project-side skill directories. Each path is scanned for a <name>/SKILL.md layout
+    # in addition to the workspace and builtin skills. Strings are expanded to absolute
+    # paths at construction time (see AgentLoop.from_config). Empty by default — a
+    # deployment that wants project-side skills sets this in their config.json.
+    extra_skills_dirs: list[str] = Field(default_factory=list)
     session_ttl_minutes: int = Field(
         default=15,
         ge=0,

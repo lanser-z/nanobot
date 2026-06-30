@@ -26,10 +26,20 @@ class SkillsLoader:
     specific tools or perform certain tasks.
     """
 
-    def __init__(self, workspace: Path, builtin_skills_dir: Path | None = None, disabled_skills: set[str] | None = None):
+    def __init__(
+        self,
+        workspace: Path,
+        builtin_skills_dir: Path | None = None,
+        disabled_skills: set[str] | None = None,
+        extra_skills_dirs: list[Path] | None = None,
+    ):
         self.workspace = workspace
         self.workspace_skills = workspace / "skills"
         self.builtin_skills = builtin_skills_dir or BUILTIN_SKILLS_DIR
+        # Project-side extra skill directories. Each dir is scanned like workspace_skills
+        # (a sibling <name>/SKILL.md layout). Listed in addition to workspace_skills and
+        # builtin_skills; the same skip_names rule applies so earlier sources shadow later.
+        self.extra_skills_dirs: list[Path] = list(extra_skills_dirs or [])
         self.disabled_skills = disabled_skills or set()
 
     def _skill_entries_from_dir(self, base: Path, source: str, *, skip_names: set[str] | None = None) -> list[dict[str, str]]:
@@ -58,11 +68,22 @@ class SkillsLoader:
         Returns:
             List of skill info dicts with 'name', 'path', 'source'.
         """
+        # Discovery order (later sources shadow earlier via skip_names):
+        # 1. workspace_skills (highest priority — workspace overrides)
+        # 2. extra_skills_dirs (project-side, e.g. backend/app/ai/skills)
+        # 3. builtin_skills (lowest priority)
         skills = self._skill_entries_from_dir(self.workspace_skills, "workspace")
-        workspace_names = {entry["name"] for entry in skills}
+        seen_names = {entry["name"] for entry in skills}
+        for extra_dir in self.extra_skills_dirs:
+            skills.extend(
+                self._skill_entries_from_dir(
+                    extra_dir, "extra", skip_names=seen_names
+                )
+            )
+            seen_names.update(entry["name"] for entry in skills)
         if self.builtin_skills and self.builtin_skills.exists():
             skills.extend(
-                self._skill_entries_from_dir(self.builtin_skills, "builtin", skip_names=workspace_names)
+                self._skill_entries_from_dir(self.builtin_skills, "builtin", skip_names=seen_names)
             )
 
         if self.disabled_skills:
@@ -82,7 +103,11 @@ class SkillsLoader:
         Returns:
             Skill content or None if not found.
         """
-        roots = [self.workspace_skills]
+        # Search order matches list_skills: workspace → extra → builtin.
+        roots: list[Path] = [self.workspace_skills]
+        for extra_dir in self.extra_skills_dirs:
+            if extra_dir not in roots:
+                roots.append(extra_dir)
         if self.builtin_skills:
             roots.append(self.builtin_skills)
         for root in roots:
