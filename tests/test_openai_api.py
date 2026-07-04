@@ -17,6 +17,7 @@ from nanobot.api.server import (
     create_app,
     handle_chat_completions,
 )
+from nanobot.agent.tools.registry import ToolRegistry
 
 try:
     from aiohttp.test_utils import TestClient, TestServer
@@ -110,21 +111,26 @@ async def test_missing_messages_returns_400(aiohttp_client, app) -> None:
 
 @pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
 @pytest.mark.asyncio
-async def test_api_key_protects_api_routes_but_not_health(aiohttp_client, mock_agent) -> None:
-    app = create_app(mock_agent, model_name="test-model", api_key="secret")
+async def test_write_op_auth_protects_tools_routes_but_not_health(aiohttp_client, mock_agent) -> None:
+    """spec runtime-tool-registration#3, #4, #7: write ops MUST auth, read ops MUST NOT."""
+    app = create_app(mock_agent, model_name="test-model", auth_token="secret", tool_registry=ToolRegistry())
     client = await aiohttp_client(app)
 
     health = await client.get("/health")
-    missing = await client.get("/v1/models")
-    wrong = await client.get("/v1/models", headers={"Authorization": "Bearer wrong"})
-    ok = await client.get("/v1/models", headers={"Authorization": "Bearer secret"})
-
     assert health.status == 200
-    assert missing.status == 401
-    assert wrong.status == 401
-    assert ok.status == 200
-    assert (await missing.json())["error"]["message"].startswith("Missing Authorization")
-    assert (await wrong.json())["error"]["message"] == "Invalid API key"
+
+    tools_list_no_auth = await client.get("/v1/tools")
+    assert tools_list_no_auth.status == 200
+
+    register_no_auth = await client.post("/v1/tools/foo/register", json={})
+    assert register_no_auth.status == 401
+
+    register_wrong = await client.post(
+        "/v1/tools/foo/register", json={}, headers={"Authorization": "Bearer wrong"}
+    )
+    assert register_wrong.status == 401
+
+    assert (await register_no_auth.json())["error"]["message"] == "Unauthorized"
 
 
 @pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")

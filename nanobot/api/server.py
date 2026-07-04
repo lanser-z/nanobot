@@ -111,7 +111,7 @@ def _sse_chunk(delta: str, model: str, chunk_id: str, finish_reason: str | None 
             }
         ],
     }
-    return f"data: {_json.dumps(payload)}\n\n".encode()
+    return f"data: {json.dumps(payload)}\n\n".encode()
 
 
 _SSE_DONE = b"data: [DONE]\n\n"
@@ -341,6 +341,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                             session_key=session_key,
                             channel="api",
                             chat_id=API_CHAT_ID,
+                            persist_user_message=False,
                         ),
                         timeout=timeout_s,
                     )

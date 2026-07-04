@@ -6,7 +6,11 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable
 
-from nanobot.agent.tools.base import Tool
+from nanobot.agent.tools.base import Tool, ToolResult
+
+
+def is_tool_error_result(name: str, result: Any) -> bool:
+    return isinstance(result, ToolResult) and result.is_error
 
 
 class HookType(str, Enum):
@@ -51,14 +55,12 @@ class ToolRegistry:
     def __init__(self):
         self._tools: dict[str, Tool] = {}
         self._cached_definitions: list[dict[str, Any]] | None = None
-        # spec tool-invocation-interface#12
         self._hooks: dict[HookType, list[Callable[[RegistryEvent], None]]] = {}
 
     def register(self, tool: Tool) -> None:
         """Register a tool."""
         self._tools[tool.name] = tool
         self._cached_definitions = None
-        # v1: ON_REGISTER defined but no-op (P3 will wire real impl)
         self._invoke_hooks(RegistryEvent(
             hook_type=HookType.ON_REGISTER,
             tool_name=tool.name,
@@ -69,14 +71,11 @@ class ToolRegistry:
         """Unregister a tool by name."""
         self._tools.pop(name, None)
         self._cached_definitions = None
-        # v1: ON_UNREGISTER defined but no-op (P3 will wire real impl)
         self._invoke_hooks(RegistryEvent(
             hook_type=HookType.ON_UNREGISTER,
             tool_name=name,
             timestamp=time.time(),
         ))
-
-    # -- Hook system — spec tool-invocation-interface#12 --
 
     def add_hook(
         self,
@@ -94,13 +93,11 @@ class ToolRegistry:
         implementation can enable them without signature change).
         """
         if event.hook_type != HookType.AUDIT:
-            # v1: skip non-AUDIT hooks (P3 will enable)
             return
         for fn in self._hooks.get(event.hook_type, []):
             try:
                 fn(event)
             except Exception:  # noqa: BLE001
-                # hook errors MUST NOT break the registry
                 pass
 
     def get(self, name: str) -> Tool | None:
@@ -176,22 +173,26 @@ class ToolRegistry:
             suggestion = self._suggest_name(str(name))
             hint = f" Did you mean '{suggestion}'? Tool names must match exactly." if suggestion else ""
             return None, params, (
-                f"Error: Tool '{name}' not found.{hint} Available: {', '.join(self.tool_names)}"
+                ToolResult.error(
+                    f"Error: Tool '{name}' not found.{hint} Available: {', '.join(self.tool_names)}"
+                )
             )
 
         params = self._coerce_params(tool, params)
         if not isinstance(params, dict):
             return tool, params, (
-                f"Error: Tool '{name}' parameters must be a JSON object, got "
-                f"{type(params).__name__}. Use named parameters like "
-                'tool_name(param1="value1", param2="value2") matching the tool schema.'
+                ToolResult.error(
+                    f"Error: Tool '{name}' parameters must be a JSON object, got "
+                    f"{type(params).__name__}. Use named parameters like "
+                    'tool_name(param1="value1", param2="value2") matching the tool schema.'
+                )
             )
 
         cast_params = tool.cast_params(params)
         errors = tool.validate_params(cast_params)
         if errors:
             return tool, cast_params, (
-                f"Error: Invalid parameters for tool '{name}': " + "; ".join(errors)
+                ToolResult.error(f"Error: Invalid parameters for tool '{name}': " + "; ".join(errors))
             )
         return tool, cast_params, None
 
@@ -232,49 +233,35 @@ class ToolRegistry:
 
     async def execute(self, name: str, params: Any) -> Any:
         """Execute a tool by name with given parameters."""
-        import time as _t
-        started = _t.monotonic()
         hint = "\n\n[Analyze the error above and try a different approach.]"
+        started = time.time()
         tool, params, error = self.prepare_call(name, params)
         if error:
             self._invoke_hooks(RegistryEvent(
                 hook_type=HookType.AUDIT,
                 tool_name=name,
                 timestamp=started,
-                duration_ms=int((_t.monotonic() - started) * 1000),
+                duration_ms=int((time.monotonic() - started) * 1000),
                 source="llm",
             ))
-            return error + hint
+            return ToolResult.error(str(error) + hint)
 
         try:
             assert tool is not None  # guarded by prepare_call()
             result = await tool.execute(**params)
-            if isinstance(result, str) and result.startswith("Error"):
-                self._invoke_hooks(RegistryEvent(
-                    hook_type=HookType.AUDIT,
-                    tool_name=name,
-                    timestamp=started,
-                    duration_ms=int((_t.monotonic() - started) * 1000),
-                    source="llm",
-                ))
-                return result + hint
-            self._invoke_hooks(RegistryEvent(
-                hook_type=HookType.AUDIT,
-                tool_name=name,
-                timestamp=started,
-                duration_ms=int((_t.monotonic() - started) * 1000),
-                source="llm",
-            ))
+            if is_tool_error_result(name, result):
+                return ToolResult.error(str(result) + hint)
             return result
         except Exception as e:
+            return ToolResult.error(f"Error executing {name}: {str(e)}" + hint)
+        finally:
             self._invoke_hooks(RegistryEvent(
                 hook_type=HookType.AUDIT,
                 tool_name=name,
                 timestamp=started,
-                duration_ms=int((_t.monotonic() - started) * 1000),
+                duration_ms=int((time.monotonic() - started) * 1000),
                 source="llm",
             ))
-            return f"Error executing {name}: {str(e)}" + hint
 
     # -- Direct invocation (bypasses LLM) — spec tool-invocation-interface#2, #13, #14 --
 
@@ -302,7 +289,6 @@ class ToolRegistry:
         from nanobot.agent.tools.invoker import CapabilityInfo
         all_tools = list(self._tools.values())
         if mode is None:
-            # default: capability + both (business-callable)
             selected = [
                 t for t in all_tools
                 if t.meta.invocation_mode in ("capability", "both")
