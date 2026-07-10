@@ -2451,5 +2451,124 @@ def _login_github_copilot() -> None:
         raise typer.Exit(1)
 
 
+# ============================================================================
+# Call & Capabilities Commands (spec: tool-invocation-interface#5, #6)
+# ============================================================================
+
+call_app = typer.Typer(help="Directly invoke tools without going through the LLM")
+capabilities_app = typer.Typer(help="List and describe registered capabilities")
+
+
+@call_app.command("run")
+def call_run(
+    tool: str = typer.Argument(..., help="Tool name to invoke"),
+    params: str = typer.Option("{}", "--params", "-p", help="JSON object of tool parameters"),
+    timeout: float | None = typer.Option(None, "--timeout", "-t", help="Timeout in seconds"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+):
+    """Invoke a single tool by name, bypassing the LLM agent loop."""
+    import json
+
+    try:
+        parsed_params = json.loads(params)
+    except json.JSONDecodeError as e:
+        console.print(f"[red]Error: --params must be valid JSON: {e}[/red]")
+        raise typer.Exit(2)
+
+    if not isinstance(parsed_params, dict):
+        console.print("[red]Error: --params must be a JSON object[/red]")
+        raise typer.Exit(2)
+
+    if timeout is not None and timeout <= 0:
+        console.print(f"[red]Error: --timeout must be positive, got {timeout}[/red]")
+        raise typer.Exit(2)
+
+    bot = Nanobot.from_config(config_path=config)
+
+    async def _invoke():
+        try:
+            return await bot.acall(tool, parsed_params, timeout=timeout)
+        finally:
+            with suppress(Exception):
+                await bot.aclose()
+
+    result = asyncio.run(_invoke())
+
+    if result.ok:
+        output = json.dumps(
+            {
+                "tool": result.tool_name,
+                "content": result.content,
+                "duration_ms": result.duration_ms,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+        console.print(output)
+    else:
+        console.print(f"[red]Error: {result.error}[/red]")
+        raise typer.Exit(1)
+
+
+@capabilities_app.command("list")
+def capabilities_list(
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+    mode: str | None = typer.Option(
+        None, "--mode", "-m", help="Filter by invocation mode (capability/both/all)"
+    ),
+):
+    """List registered capabilities."""
+    bot = Nanobot.from_config(config_path=config)
+    caps = bot.list_capabilities(mode=mode)
+    if not caps:
+        console.print("[dim]No capabilities registered.[/dim]")
+        return
+    table = Table(title="Capabilities")
+    table.add_column("Name", style="cyan")
+    table.add_column("Description")
+    table.add_column("Mode")
+    table.add_column("Owner", style="dim")
+    for cap in caps:
+        table.add_row(
+            cap.name,
+            cap.description,
+            cap.meta.invocation_mode,
+            cap.meta.owner,
+        )
+    console.print(table)
+
+
+@capabilities_app.command("describe")
+def capabilities_describe(
+    name: str = typer.Argument(..., help="Capability name"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+):
+    """Describe a single capability's metadata and schema."""
+    bot = Nanobot.from_config(config_path=config)
+    meta = bot.get_capability_metadata(name)
+    if meta is None:
+        console.print(f"[red]Error: capability '{name}' not found[/red]")
+        raise typer.Exit(1)
+
+    info = {
+        "name": meta.name,
+        "invocation_mode": meta.invocation_mode,
+        "is_long_running": meta.is_long_running,
+        "is_idempotent": meta.is_idempotent,
+        "requires_auth": list(meta.requires_auth),
+        "timeout_s": meta.timeout_s,
+        "side_effect_class": meta.side_effect_class,
+        "owner": meta.owner,
+        "version": meta.version,
+        "status": meta.status,
+        "tags": list(meta.tags),
+    }
+    console.print_json(data=info)
+
+
+app.add_typer(call_app, name="call")
+app.add_typer(capabilities_app, name="capabilities")
+
+
 if __name__ == "__main__":
     app()
